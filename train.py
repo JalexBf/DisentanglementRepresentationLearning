@@ -30,6 +30,7 @@ class Shapes3DDataset(Dataset):
         label = self.labels[idx]
         return torch.tensor(image, dtype=torch.float32), label
 
+
 # 3-Layer U-Net for conditional noise prediction
 class UNet(nn.Module):
     def __init__(self, in_channels, out_channels, base_channels=64, cond_dim=6):
@@ -37,8 +38,10 @@ class UNet(nn.Module):
 
         self.label_embed = nn.Sequential(
             nn.Linear(cond_dim, base_channels * 4),
+            nn.BatchNorm1d(base_channels * 4),
             nn.ReLU(),
             nn.Linear(base_channels * 4, base_channels * 8),
+            nn.BatchNorm1d(base_channels * 8),
             nn.ReLU(),
             nn.Linear(base_channels * 8, base_channels * 4),
             nn.LayerNorm(base_channels * 4),
@@ -74,89 +77,213 @@ class UNet(nn.Module):
         self.dec1 = nn.Conv2d(base_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x, cond):
-        cond = (cond - cond.mean(dim=0, keepdim=True)) / (cond.std(dim=0, keepdim=True) + 1e-8)  # Normalize labels
+        # Normalize labels
+        cond_std = torch.clamp(cond.std(dim=0, keepdim=True), min=1e-8)
+        cond = (cond - cond.mean(dim=0, keepdim=True)) / cond_std
+
+        # Embed and expand conditioning labels
         cond_embed = self.label_embed(cond).view(cond.size(0), -1, 1, 1)
         cond_embed = cond_embed.expand(-1, -1, x.size(2), x.size(3))
         x = torch.cat([x, cond_embed], dim=1)
+
+        # Encoder
         e1 = self.enc1(x)
         e2 = self.enc2(e1)
         e3 = self.enc3(e2)
+
+        # Decoder
         d3 = self.dec3(e3) + e2
         d2 = self.dec2(d3) + e1
-        return self.dec1(d2)
+        output = torch.tanh(self.dec1(d2))  # Normalize output
+
+        # Debugging intermediate outputs
+        """print(f"Debug Encoder: e1_mean={e1.mean().item()}, e1_std={e1.std().item()}, "
+              f"e2_mean={e2.mean().item()}, e2_std={e2.std().item()}, e3_mean={e3.mean().item()}, e3_std={e3.std().item()}")
+        print(f"Debug Decoder: d3_mean={d3.mean().item()}, d3_std={d3.std().item()}, "
+              f"d2_mean={d2.mean().item()}, d2_std={d2.std().item()}")"""
+
+        return output
+
 
 # Linear Beta Schedule
-def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
+def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.005):
     return torch.linspace(beta_start, beta_end, timesteps, device="cuda")
 
-# Forward Diffusion
+
 def forward_diffusion(x_0, t, beta):
-    batch_size = x_0.size(0)
+    """
+    Forward diffusion to compute x_t from x_0 for timestep t.
+    """
+    alpha = 1 - beta
+    alpha_bar = torch.cumprod(alpha, dim=0)  # Cumulative product of alphas
+
+    # Select alpha_bar_t for the batch
+    alpha_bar_t = alpha_bar[t].view(-1, 1, 1, 1)
+
+    # Generate noise
     noise = torch.randn_like(x_0)
-    beta_t = beta[t].view(batch_size, 1, 1, 1)
-    alpha_bar_t = torch.cumprod(1 - beta, dim=0)[t].view(batch_size, 1, 1, 1)
+
+    # Compute x_t
     x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
-    print(f"Debug Forward Diffusion: x_0={x_0.mean().item()}, x_t={x_t.mean().item()}, noise={noise.mean().item()}")
+    #print(f"Forward Diffusion: x_0 shape={x_0.shape}, x_t shape={x_t.shape}")
+
     return x_t, noise
 
+
+
+
+
 # Reverse Diffusion
-def sample(model, beta, timesteps, x_t=None, cond=None):
+def sample(model, beta, timesteps, x_t, cond):
+    """
+    Reverse diffusion process to generate x_0 from x_T iteratively for a batch.
+    """
     alpha = 1 - beta
     alpha_bar = torch.cumprod(alpha, dim=0)
 
-    if x_t is None:
-        x_t = torch.randn((cond.size(0), 3, 64, 64), device="cuda")  # Initialize with noise
+    batch_size = x_t.size(0)  # Ensure x_t has the batch dimension
+    for t in reversed(range(timesteps)):
+        alpha_t = alpha[t]
+        alpha_bar_t = alpha_bar[t].view(1, 1, 1, 1).expand(batch_size, -1, -1, -1)
+        beta_t = beta[t].view(1, 1, 1, 1).expand(batch_size, -1, -1, -1)
 
-    for t in reversed(range(len(alpha_bar))):
-        alpha_bar_t = alpha_bar[t].view(1, 1, 1, 1)
+        # Predict noise added at timestep t
         noise_pred = model(x_t, cond)
-        print(f"Debug Reverse Diffusion Step {t}: x_t_mean={x_t.mean().item()}, x_t_std={x_t.std().item()}, noise_pred_mean={noise_pred.mean().item()}, noise_pred_std={noise_pred.std().item()}")  # Debug output
-        noise = torch.randn_like(x_t) if t > 0 else 0
-        x_t = (x_t - torch.sqrt(1 - alpha_bar_t) * noise_pred) / torch.sqrt(alpha_bar_t) + torch.sqrt(beta[t]) * noise
+
+        # Compute mean of x_{t-1}
+        mean = (1 / torch.sqrt(alpha_t)) * (
+            x_t - (beta_t / torch.sqrt(1 - alpha_bar_t)) * noise_pred
+        )
+
+        # Add noise if t > 0
+        if t > 0:
+            noise = torch.randn_like(x_t)  # Ensure batch-level noise
+            variance = torch.sqrt(beta_t)
+            x_t = mean + variance * noise
+        else:
+            x_t = mean  # No noise added at t=0
+
+
+        """print(f"Reverse Diffusion: Initial x_t shape={x_t.shape}")
+
+        print(f"Debug Reverse Diffusion Step {t}: x_t_mean={x_t.mean().item()}, x_t_std={x_t.std().item()}, "
+              f"noise_pred_mean={noise_pred.mean().item()}, noise_pred_std={noise_pred.std().item()}")"""
 
     return x_t
 
 
+
+
+
 # Loss Function
 def diffusion_loss(model, x_0, t, cond, beta):
+    """
+    Compute the diffusion loss by comparing predicted noise with actual noise.
+    """
+    # Forward diffusion to get x_t and true noise
     x_t, noise = forward_diffusion(x_0, t, beta)
+
+    # Predict noise using the model
     pred_noise = model(x_t, cond)
-    loss = F.mse_loss(pred_noise, noise)
-    print(f"Debug Loss: Loss={loss.item()}")
+
+    # Compute mean squared error loss
+    loss = 10.0 * F.mse_loss(pred_noise, noise)
     return loss
+
+
+
+def save_checkpoint(model, optimizer, epoch, checkpoint_dir):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pth"))
+    print(f"Checkpoint saved at {checkpoint_dir}/checkpoint_epoch_{epoch}.pth")
+
+
+def load_checkpoint(model, optimizer, checkpoint_dir):
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_epoch_")]
+    if not checkpoints:
+        print(f"No checkpoints found in {checkpoint_dir}. Starting from epoch 0.")
+        return 0
+    latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    print(f"Loaded checkpoint from {checkpoint_path}. Resuming from epoch {checkpoint['epoch'] + 1}.")
+    return checkpoint['epoch'] + 1
+
+
 
 # Training Function
 def train(model, dataloader, optimizer, scheduler, beta, timesteps, epochs, checkpoint_dir, sample_save_dir):
+    start_epoch = load_checkpoint(model, optimizer, checkpoint_dir)
     os.makedirs(sample_save_dir, exist_ok=True)
-    for epoch in range(epochs):
+
+    for epoch in range(start_epoch, start_epoch + epochs):
         model.train()
         total_loss = 0
-        for images, labels in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}"):
+        for step, (images, labels) in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
             images = images.permute(0, 3, 1, 2).to("cuda")
             labels = labels.to("cuda")
             optimizer.zero_grad()
+
+            # Random timestep for training
             t = torch.randint(0, timesteps, (images.size(0),), device="cuda").long()
+
+            # Compute loss
             loss = diffusion_loss(model, images, t, labels, beta)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+
             total_loss += loss.item()
+
+            # Debug condition embedding stats every 100 steps
+            if step % 100 == 0:
+                with torch.no_grad():
+                    cond_embed = model.label_embed(labels).view(labels.size(0), -1)
+                    print(f"Epoch {epoch + 1}, Step {step}: Condition embedding mean={cond_embed.mean().item()}, std={cond_embed.std().item()}")
 
         scheduler.step()
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader)}")
 
-        # Save a sample
+        save_checkpoint(model, optimizer, epoch, checkpoint_dir)
+
+        # Generate and save a sample (batch-level)
         with torch.no_grad():
-            sample_noise = torch.randn((1, 3, 64, 64), device="cuda")
-            labels_sample = labels[:1]
-            generated_sample = sample(model, beta, timesteps, x_t=sample_noise, cond=labels_sample)
-            vutils.save_image(generated_sample[0], f"{sample_save_dir}/sample_epoch_{epoch + 1}.png", normalize=True)
+            batch_size = min(8, images.size(0))  # Ensure we don't exceed the current batch size
+            x_t = torch.randn(batch_size, 3, 64, 64, device="cuda")  # Start from pure noise
+            print(f"Sampling: Batch size={x_t.size(0)}, x_t shape={x_t.shape}")
+
+            generated_sample = sample(model, beta, timesteps, x_t, labels[:batch_size])
+
+            # Save only a few samples for visualization
+            for i in range(batch_size):
+                sample_save_path = os.path.join(sample_save_dir, f"sample_epoch_{epoch + 1}_{i}.png")
+                vutils.save_image(generated_sample[i], sample_save_path, normalize=True)
+                print(f"Sample saved to {sample_save_path}")
+
+
+
 
 # Main Script
 if __name__ == "__main__":
     dataset = Shapes3DDataset("3dshapes.h5")
     dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
     model = UNet(3, 3).to("cuda")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW([
+        {'params': model.label_embed.parameters(), 'lr': 1e-3},
+        {'params': model.enc1.parameters()},
+        {'params': model.enc2.parameters()},
+        {'params': model.enc3.parameters()},
+        {'params': model.dec3.parameters()},
+        {'params': model.dec2.parameters()},
+        {'params': model.dec1.parameters()}
+    ], lr=5e-5)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
     timesteps = 100
     beta = linear_beta_schedule(timesteps)
