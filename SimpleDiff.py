@@ -134,18 +134,8 @@ class UNet(nn.Module):
         )
 
         # Conditional embedding (for shape, scale, orient, posX, posY)
-        self.cond_emb = nn.Sequential(
-            nn.Embedding(3, cond_emb_dim),   # shape
-            nn.Embedding(6, cond_emb_dim),   # scale
-            nn.Embedding(40, cond_emb_dim),  # orientation
-            nn.Embedding(32, cond_emb_dim),  # posX
-            nn.Embedding(32, cond_emb_dim),  # posY
-        )
-        self.cond_proj = nn.Sequential(
-            nn.Linear(cond_emb_dim * 5, cond_emb_dim),
-            nn.SiLU(),
-            nn.Linear(cond_emb_dim, cond_emb_dim)
-        )
+        self.cond_emb = ConditionalEmbedding(cond_emb_dim)
+
 
         # First conv
         self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
@@ -162,10 +152,10 @@ class UNet(nn.Module):
 
         # Up
         self.up1 = Upsample(base_channels * 4)
-        self.up_block1 = ResidualBlock(base_channels * 4, base_channels * 2, time_emb_dim, cond_emb_dim)
+        self.up_block1 = ResidualBlock(base_channels * 4 + base_channels * 2, base_channels * 2, time_emb_dim, cond_emb_dim)
         self.up2 = Upsample(base_channels * 2)
-        self.up_block2 = ResidualBlock(base_channels * 2, base_channels, time_emb_dim, cond_emb_dim)
-
+        self.up_block2 = ResidualBlock(base_channels * 2 + base_channels, base_channels, time_emb_dim, cond_emb_dim)
+        
         # Output conv
         self.conv_out = nn.Sequential(
             nn.GroupNorm(8, base_channels),
@@ -177,12 +167,7 @@ class UNet(nn.Module):
     def forward(self, x, t, latents):
         t_emb = self.time_mlp(t)
 
-        s = self.cond_emb[0](latents[:, 1])  # shape
-        sc = self.cond_emb[1](latents[:, 2])  # scale
-        o = self.cond_emb[2](latents[:, 3])  # orient
-        x_pos = self.cond_emb[3](latents[:, 4])  # x
-        y_pos = self.cond_emb[4](latents[:, 5])  # y
-        cond = self.cond_proj(torch.cat([s, sc, o, x_pos, y_pos], dim=1))
+        cond = self.cond_emb(latents)
 
         x1 = self.conv_in(x)
         x2 = self.down1(x1, t_emb, cond)
@@ -325,6 +310,8 @@ if __name__ == "__main__":
 
     save_every = 1  # epochs
 
+    sampler = FeatureSampler(model, ddpm, device)
+
     for epoch in range(1, 21):  
         for i, (imgs, latents) in enumerate(dataloader):
             imgs = imgs.to(device)
@@ -356,7 +343,6 @@ if __name__ == "__main__":
             print(f"Saved checkpoint at epoch {epoch}")
 
             
-            sampler = FeatureSampler(model, ddpm, device)
             sampler.sample_all_features(epoch)
 
 
