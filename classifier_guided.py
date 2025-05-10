@@ -7,6 +7,7 @@ from torchvision.utils import save_image
 import os
 import math
 from copy import deepcopy
+from classifier import DSpritesFeatureClassifier
 
 # ------------------------------
 # Dataset Loader
@@ -81,6 +82,7 @@ class ResidualBlock(nn.Module):
         self.time_proj = nn.Linear(time_emb_dim, out_channels)
         self.cond_proj = nn.Linear(cond_emb_dim, out_channels)
 
+        # 2 convolutional blocks
         self.block1 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1),
             nn.GroupNorm(8, out_channels),
@@ -91,12 +93,15 @@ class ResidualBlock(nn.Module):
             nn.GroupNorm(8, out_channels),
             nn.SiLU()
         )
+        # Skin connection
         self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, t, c):
         h = self.block1(x)
-        time_emb = self.time_proj(t).unsqueeze(-1).unsqueeze(-1)
+        time_emb = self.time_proj(t).unsqueeze(-1).unsqueeze(-1)    # Shape: (B, out_channels)
         cond_emb = self.cond_proj(c).unsqueeze(-1).unsqueeze(-1)
+        
+        # Add the time and cond embeddings to the feature map
         h = h + time_emb + cond_emb
         h = self.block2(h)
         return h + self.shortcut(x)
@@ -122,7 +127,6 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
-
 
 
 
@@ -169,8 +173,9 @@ class UNet(nn.Module):
             nn.SiLU(),
             nn.Conv2d(base_channels, in_channels, 3, padding=1)
         )
-        self.skip1 = nn.Conv2d(128, 64, 1)
-        self.skip2 = nn.Conv2d(96, 32, 1)
+        self.skip1 = nn.Conv2d(base_channels * 6, base_channels * 2, 1)
+        self.skip2 = nn.Conv2d(base_channels * 3, base_channels, 1)
+
 
         self.final_upsample = Upsample(base_channels, base_channels)
 
@@ -195,9 +200,9 @@ class UNet(nn.Module):
         x4 = self.bot1(x3_down, t_emb, cond)
         x4 = self.bot2(x4, t_emb, cond)
 
-        # This is wrong, but it works, so let's assume it's right
+        # This is wrong, but it works, so let's assume it's right (concatenate with x3, not x2_down)
         x = self.up1(x4)
-        x = torch.cat((x, x2_down), dim=1)
+        x = torch.cat((x, x3), dim=1)  # use x3 instead of x2_down
         x = self.skip1(x)
         x = self.up_block1(x, t_emb, cond)
 
@@ -223,25 +228,60 @@ class DDPM:
         self.beta = torch.linspace(beta_start, beta_end, timesteps, device=device)
         self.alpha = 1. - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+        self.classifier = DSpritesFeatureClassifier().to(device)
+        self.classifier.load_state_dict(torch.load("dsprites_classifier.pt", map_location=device))
+        self.classifier.eval()
+        #FReeze classifier parameters
+        for p in self.classifier.parameters():
+            p.requires_grad = False
+
 
     def noise_schedule(self, x0, t):
-        noise = torch.randn_like(x0)
+        noise = torch.randn_like(x0)    # Gaussian noise
         batch_size = x0.size(0)
+
+        # Extract the cumulative noise factor for specific time step
         sqrt_alpha_hat = self.alpha_hat[t].reshape(batch_size, 1, 1, 1) ** 0.5
         sqrt_one_minus = (1 - self.alpha_hat[t]).reshape(batch_size, 1, 1, 1) ** 0.5
-        xt = sqrt_alpha_hat * x0 + sqrt_one_minus * noise
+        
+        xt = sqrt_alpha_hat * x0 + sqrt_one_minus * noise   # Noisy image
         return xt, noise
 
-    def train_step(self, x0, latents):
+
+    def train_step(self, x0, latents, classifier_weight=0.2):
         self.model.train()
         B = x0.size(0)
         device = x0.device
+
+        # Randomly sample a time step for each image
         t = torch.randint(0, self.T, (B,), dtype=torch.long, device=device)
-        xt, noise = self.noise_schedule(x0, t)
+        xt, noise = self.noise_schedule(x0, t)  # Apply noise at selected timestep
         pred_noise = self.model(xt, t, latents)
-        return F.mse_loss(pred_noise, noise)
+
+        # Standard DDPM loss
+        loss = F.mse_loss(pred_noise, noise)
+
+        # Reconstruct image from pred_noise (approximate x0)
+        alpha_hat = self.alpha_hat[t].reshape(B, 1, 1, 1)
+        x0_hat = (xt - (1 - alpha_hat).sqrt() * pred_noise) / alpha_hat.sqrt()
+        x0_hat = x0_hat.clamp(-1, 1)
+
+        # Classifier regularization (latent prediction from image)
+        preds = self.classifier(x0_hat)
+
+        disent_loss = sum([
+            F.cross_entropy(preds[0], latents[:, 1]),  # shape
+            F.cross_entropy(preds[1], latents[:, 2]),  # scale
+            F.cross_entropy(preds[2], latents[:, 3]),  # orient
+            F.cross_entropy(preds[3], latents[:, 4]),  # posX
+            F.cross_entropy(preds[4], latents[:, 5]),  # posY
+        ])
+
+        total_loss = loss + classifier_weight * disent_loss
+        return total_loss, loss.detach(), disent_loss.detach(), preds
 
 
+    # Reverse diffusion process
     @torch.no_grad()
     def sample(self, img_size, latents):
         device = next(self.model.parameters()).device
@@ -255,14 +295,19 @@ class DDPM:
             alpha_hat = self.alpha_hat[t]
             beta = self.beta[t]
 
+            # Add Gaussian noise at each step except the last one
             noise = torch.randn_like(img) if t > 0 else torch.zeros_like(img)
+            
+            # Reverse diffusion step
             img = (1 / alpha.sqrt()) * (img - ((1 - alpha) / (1 - alpha_hat).sqrt()) * pred_noise) + beta.sqrt() * noise
 
         return img.clamp(-1, 1)
 
 
 
-
+# ------------------------------
+# Feature Sampling
+# ------------------------------
 class FeatureSampler:
     def __init__(self, model, ddpm, device, img_size=64):
         self.model = model
@@ -279,7 +324,7 @@ class FeatureSampler:
         }
 
     @torch.no_grad()
-    def sample_feature(self, feature_name, epoch, save_dir='./samples', max_samples=16):
+    def sample_feature(self, feature_name, epoch, save_dir='./classifier_samples', max_samples=16):
         idx, num_values = self.feature_info[feature_name]
 
         # How many values to sample
@@ -307,9 +352,10 @@ class FeatureSampler:
         save_image(sampled_imgs, f"{save_dir}/{feature_name}_epoch_{epoch}.png", nrow=4)
         print(f"Saved {feature_name} grid at epoch {epoch}")
 
-    def sample_all_features(self, epoch, save_dir='./samples', max_samples=16):
+    def sample_all_features(self, epoch, save_dir='./classifier_samples', max_samples=16):
         for feature_name in self.feature_info.keys():
             self.sample_feature(feature_name, epoch, save_dir, max_samples)
+
 
 
 # ------------------------------
@@ -327,8 +373,9 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20) # 20 epochs
 
-    os.makedirs('./checkpoints', exist_ok=True)
-    os.makedirs('./samples', exist_ok=True)
+
+    os.makedirs('./classifier_checkpoints', exist_ok=True)
+    os.makedirs('./classifier_samples', exist_ok=True)
 
     save_every = 1  # epochs
 
@@ -336,30 +383,34 @@ if __name__ == "__main__":
         for i, (imgs, latents) in enumerate(dataloader):
             imgs = imgs.to(device)
             latents = latents.to(device)
+            
             try:
-                loss = ddpm.train_step(imgs, latents)
+                total_loss, mse_loss, class_loss, preds = ddpm.train_step(imgs, latents, classifier_weight=0.2)
             except RuntimeError as e:
                 if 'out of memory' in str(e):
                     print(f"OOM at epoch {epoch}, step {i} — batch skipped.")
                     torch.cuda.empty_cache()
                     continue
                 else:
-                    raise e  # re-raise if it's another kind of RuntimeError
-
+                    raise e
 
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
             if i % 100 == 0:
                 with torch.no_grad():
+                    pred_labels = [p.argmax(1) for p in preds]
+                    # preds[0:5] must match latents[:, 1:6] → shape, scale, orient, posX, posY
+                    accs = [((pred == latents[:, j+1]).float().mean().item()) for j, pred in enumerate(pred_labels)]
+                    print(f"Accuracies: shape={accs[0]:.2f}, scale={accs[1]:.2f}, orient={accs[2]:.2f}, posX={accs[3]:.2f}, posY={accs[4]:.2f}")
+
                     t = torch.randint(0, ddpm.T, (imgs.size(0),), device=imgs.device)
                     xt, noise = ddpm.noise_schedule(imgs, t)
-
                     mean_xt = xt.abs().mean().item()
                     mean_noise = noise.abs().mean().item()
 
-                print(f"Epoch {epoch} | Step {i} | Loss: {loss.item():.4f} | Mean xt abs: {mean_xt:.4f} | Mean noise abs: {mean_noise:.4f}")
+                print(f"Epoch {epoch} | Step {i} | Total: {total_loss.item():.4f} | MSE: {mse_loss.item():.4f} | Classifier: {class_loss.item():.4f} | Mean xt: {mean_xt:.4f} | Mean noise: {mean_noise:.4f}")
 
         # Save checkpoint & samples every few epochs
         if epoch % save_every == 0:
@@ -368,7 +419,7 @@ if __name__ == "__main__":
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'epoch': epoch,
-            }, f'./checkpoints/ddpm_epoch_{epoch}.pt')
+            }, f'./classifier_checkpoints/ddpm_epoch_{epoch}.pt')
             print(f"Saved checkpoint at epoch {epoch}")
 
             sampler = FeatureSampler(model, ddpm, device)

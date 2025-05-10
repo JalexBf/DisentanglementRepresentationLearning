@@ -46,13 +46,16 @@ class ConditionalEmbedding(nn.Module):
             nn.Linear(emb_dim, emb_dim)
         )
 
-    def forward(self, latents):  # (B, 5)
-        s = self.shape(latents[:, 1])   # shape
-        sc = self.scale(latents[:, 2])  # scale
-        o = self.orient(latents[:, 3])  # orientation
-        x = self.pos_x(latents[:, 4])   # posX
-        y = self.pos_y(latents[:, 5])   # posY
+    def forward(self, latents):
+        if latents is None:
+            return None  # allow DDPM to handle this case
+        s = self.shape(latents[:, 1])
+        sc = self.scale(latents[:, 2])
+        o = self.orient(latents[:, 3])
+        x = self.pos_x(latents[:, 4])
+        y = self.pos_y(latents[:, 5])
         return self.out(torch.cat([s, sc, o, x, y], dim=1))
+    
 
 
 # ------------------------------
@@ -141,8 +144,6 @@ class UNet(nn.Module):
 
         # First conv
         self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
-        self.cond_to_input = nn.Linear(cond_emb_dim, base_channels)
-
 
         # Down
         self.down1 = ResidualBlock(base_channels, base_channels * 2, time_emb_dim, cond_emb_dim)
@@ -179,14 +180,13 @@ class UNet(nn.Module):
 
     def forward(self, x, t, latents):
         t_emb = self.time_mlp(t)
+
         cond = self.cond_emb(latents)
+        if cond is None:
+            cond = torch.zeros(x.size(0), 128, device=x.device)
 
-        cond_proj = self.cond_to_input(cond)                  # (B, base_channels)
-        cond_proj = cond_proj[:, :, None, None]               # (B, base_channels, 1, 1)
-        cond_proj = cond_proj.expand(-1, -1, x.shape[2], x.shape[3])  # (B, base_channels, H, W)
 
-        x1 = self.conv_in(x) + cond_proj                      # Inject latents at input
-
+        x1 = self.conv_in(x)
         x2 = self.down1(x1, t_emb, cond)
         x2_down = self.downsample1(x2)
         x3 = self.down2(x2_down, t_emb, cond)
@@ -232,24 +232,40 @@ class DDPM:
         xt = sqrt_alpha_hat * x0 + sqrt_one_minus * noise
         return xt, noise
 
-    def train_step(self, x0, latents):
+    def train_step(self, x0, latents, cond_drop_prob=0.1):
         self.model.train()
         B = x0.size(0)
         device = x0.device
         t = torch.randint(0, self.T, (B,), dtype=torch.long, device=device)
         xt, noise = self.noise_schedule(x0, t)
-        pred_noise = self.model(xt, t, latents)
+
+        # Randomly drop conditioning
+        mask = torch.rand(B, device=device) < cond_drop_prob
+        print(f"[CFG] Dropped conditioning for {mask.sum().item()}/{B} samples")
+        latents_dropped = latents.clone()
+        latents_dropped[mask] = -1  # Make them invalid — triggers zero embedding
+
+        pred_noise = self.model(xt, t, latents_dropped)
         return F.mse_loss(pred_noise, noise)
 
 
+
+
     @torch.no_grad()
-    def sample(self, img_size, latents):
+    def sample(self, img_size, latents, guidance_weight=3.0):
         device = next(self.model.parameters()).device
         batch_size = latents.size(0)
         img = torch.randn(batch_size, 1, img_size, img_size, device=device)
+
         for t in reversed(range(self.T)):
             time = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            pred_noise = self.model(img, time, latents)
+
+            # CFG: get both conditional and unconditional predictions
+            pred_cond = self.model(img, time, latents)
+            pred_uncond = self.model(img, time, None)
+
+            # Blend
+            pred_noise = (1 + guidance_weight) * pred_cond - guidance_weight * pred_uncond
 
             alpha = self.alpha[t]
             alpha_hat = self.alpha_hat[t]
@@ -279,7 +295,7 @@ class FeatureSampler:
         }
 
     @torch.no_grad()
-    def sample_feature(self, feature_name, epoch, save_dir='./samples', max_samples=16):
+    def sample_feature(self, feature_name, epoch, save_dir='./cfg', max_samples=16):
         idx, num_values = self.feature_info[feature_name]
 
         # How many values to sample
@@ -299,7 +315,7 @@ class FeatureSampler:
         fixed_latents = torch.tensor(fixed_latents, dtype=torch.long, device=self.device)
 
         # Generate images
-        sampled_imgs = self.ddpm.sample(self.img_size, fixed_latents)
+        sampled_imgs = self.ddpm.sample(self.img_size, fixed_latents, guidance_weight=3.0)
 
         sampled_imgs = (sampled_imgs + 1) * 0.5
 
@@ -307,7 +323,7 @@ class FeatureSampler:
         save_image(sampled_imgs, f"{save_dir}/{feature_name}_epoch_{epoch}.png", nrow=4)
         print(f"Saved {feature_name} grid at epoch {epoch}")
 
-    def sample_all_features(self, epoch, save_dir='./samples', max_samples=16):
+    def sample_all_features(self, epoch, save_dir='./cfg', max_samples=16):
         for feature_name in self.feature_info.keys():
             self.sample_feature(feature_name, epoch, save_dir, max_samples)
 
@@ -318,7 +334,7 @@ class FeatureSampler:
 if __name__ == "__main__":
 
     dataset = DSpritesLazyDataset('dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz')
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = UNet(base_channels=32).to(device)
@@ -327,8 +343,8 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20) # 20 epochs
 
-    os.makedirs('./checkpoints', exist_ok=True)
-    os.makedirs('./samples', exist_ok=True)
+    os.makedirs('./cfg', exist_ok=True)
+    os.makedirs('./cfg_checkpoints', exist_ok=True)
 
     save_every = 1  # epochs
 
@@ -368,7 +384,7 @@ if __name__ == "__main__":
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'epoch': epoch,
-            }, f'./checkpoints/ddpm_epoch_{epoch}.pt')
+            }, f'./cfg_checkpoints/ddpm_epoch_{epoch}.pt')
             print(f"Saved checkpoint at epoch {epoch}")
 
             sampler = FeatureSampler(model, ddpm, device)

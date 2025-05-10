@@ -35,7 +35,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load dataset
-    dataset = DSpritesDataset("dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz")
+    dataset = DSpritesDataset("./generated_samples/generated_dsprites.npz")
     dataloader = DataLoader(dataset, batch_size=512, shuffle=False)
 
     # Load model from file

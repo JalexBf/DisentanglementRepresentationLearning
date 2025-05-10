@@ -22,6 +22,20 @@ class DSpritesDataset(Dataset):
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return img, label
 
+
+class CoordConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels + 2, out_channels, **kwargs)
+
+    def forward(self, x):
+        B, _, H, W = x.size()
+        xx = torch.linspace(-1, 1, W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
+        yy = torch.linspace(-1, 1, H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
+        x = torch.cat([x, xx, yy], dim=1)
+        return self.conv(x)
+
+
 # ------------------------------
 # Model
 # ------------------------------
@@ -29,7 +43,7 @@ class DSpritesFeatureClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.Conv2d(1, 32, 4, 2, 1),  # 64 → 32
+            CoordConv2d(1, 32, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2, 1),  # 32 → 16
             nn.ReLU(),
