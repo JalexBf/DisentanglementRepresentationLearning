@@ -1,56 +1,38 @@
-import torch
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-from classifier_guided import UNet, DSpritesLazyDataset  
+from unsupervised import DSpritesLazyDataset, LatentEncoder
 
-def extract_latents_and_factors(npz_path, model_path, output_latents_path, output_factors_path, batch_size=64):
-    """
-    Extracts the conditional embeddings (as latents) and ground truth factors from the trained model.
-    Saves them as .npy files for metric evaluation.
-    """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# === Load dataset ===
+dataset = DSpritesLazyDataset('dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz')
+dataloader = DataLoader(dataset, batch_size=128, shuffle=False)
 
-    # Load dataset
-    dataset = DSpritesLazyDataset(npz_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+# === Load trained encoder ===
+encoder = LatentEncoder(z_dim=10)  # adjust z_dim if needed
+encoder.load_state_dict(torch.load('./unsupervised_checkpoints/encoder_epoch_20.pt', map_location='cpu'))
+encoder.eval()
 
-    # Load model
-    model = UNet(base_channels=32).to(device)
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+encoder = encoder.to(device)
 
-    all_latents = []
-    all_factors = []
+# === Encode latents ===
+all_z = []
+all_factors = []
 
-    for imgs, latents in tqdm(dataloader, desc="Extracting Latents"):
-        latents = latents.to(device)
+with torch.no_grad():
+    for i, (x, latents) in enumerate(dataloader):
+        if len(all_z) >= 10000:  # Google library defaults to 10k
+            break
+        x = x.to(device)
+        z = encoder(x).cpu().numpy()  # (B, z_dim)
+        y = latents[:, 1:6].numpy()   # ground-truth factors
 
-        # Extract conditional embeddings as "latent representations"
-        with torch.no_grad():
-            cond_emb = model.cond_emb(latents)  # Shape: (B, emb_dim)
-            all_latents.append(cond_emb.cpu().numpy())
-            all_factors.append(latents[:, 1:].cpu().numpy())  # Exclude dataset index
+        all_z.append(z)
+        all_factors.append(y)
 
-    # Concatenate all batches
-    all_latents = np.concatenate(all_latents, axis=0)
-    all_factors = np.concatenate(all_factors, axis=0)
+# === Save as NPZ ===
+z = np.concatenate(all_z, axis=0)
+factors = np.concatenate(all_factors, axis=0)
+np.savez('representation.npz', representations=z, factors=factors)
 
-    # Save as .npy files
-    np.save(output_latents_path, all_latents)
-    np.save(output_factors_path, all_factors)
-
-    print(f"Saved latents to {output_latents_path}")
-    print(f"Saved factors to {output_factors_path}")
-
-
-if __name__ == "__main__":
-    dataset_path = "dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz"
-    model_checkpoint = "./classifier_checkpoints/ddpm_epoch_20.pt"
-
-    # Output paths for latents and factors
-    output_latents_path = "latents.npy"
-    output_factors_path = "factors.npy"
-
-    extract_latents_and_factors(dataset_path, model_checkpoint, output_latents_path, output_factors_path)
+print(f"Saved to 'representation.npz' with shape: z={z.shape}, factors={factors.shape}")

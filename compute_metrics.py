@@ -1,70 +1,63 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress TensorFlow logs
+
 import numpy as np
+import gin
+import time
 from disentanglement_lib.evaluation.metrics import mig, dci, sap_score
 
 
-class DataWrapper:
-    """A wrapper to provide a `.sample()` method for the factors array."""
-
+class NumpyGroundTruth:
     def __init__(self, factors):
         self.factors = factors
+        self.num_total_factors = factors.shape[1]
 
-    def sample(self, num_samples, random_state):
-        """Returns a batch of samples with factors and indices."""
-        rng = np.random.default_rng(random_state)
-        indices = rng.integers(0, len(self.factors), size=num_samples)
-        sampled_factors = self.factors[indices]
-        return sampled_factors, indices
+    def sample(self, num_points, random_state):
+        indices = random_state.choice(self.factors.shape[0], num_points)
+        return None, self.factors[indices]  # MIG only uses factors
 
 
-def representation_function(latents, indices):
-    """A simple representation function that returns the latents given indices."""
-    return latents[indices]
+
+# Bind only MIG gin parameter
+gin.bind_parameter("mig.num_train", 1000)
+
+# Load data
+data = np.load("representation.npz")
+z = data["z"]
+factors = data["y"]
+
+# Set random seed
+random_state = np.random.RandomState(42)
+
+start = time.time()
+
+class RepresentationFunction:
+    def __init__(self, z):
+        self.z = z
+        self.index = 0
+
+    def __call__(self, x):
+        batch_size = x.shape[0]
+        result = self.z[self.index:self.index + batch_size]
+        self.index += batch_size
+        return result
 
 
-def compute_disentanglement_metrics(latents_path, factors_path, num_train=10000, random_state=42):
-    """
-    Computes MIG, DCI, SAP metrics using the Disentanglement Library.
-    """
-    latents = np.load(latents_path)
-    factors = np.load(factors_path)
+# MIG needs random_state
+ground_truth = NumpyGroundTruth(factors)
+rep_fn = RepresentationFunction(z)
+mig_score = mig.compute_mig(
+    ground_truth,
+    rep_fn,
+    random_state=random_state
+)["mig"]
 
-    # Wrap factors in DataWrapper to provide a `.sample()` method for MIG only
-    ground_truth_data = DataWrapper(factors)
+print(f"MIG: {mig_score:.4f} (took {time.time() - start:.2f}s)")
 
-    # MIG
-    mig_score = mig.compute_mig(
-        ground_truth_data=ground_truth_data,
-        representation_function=lambda indices: representation_function(latents, indices),
-        num_train=num_train,
-        random_state=random_state
-    )["discrete_mig"]
+# DCI and SAP are fine
+dci_scores = dci.compute_dci(z, factors, train_size=10000, test_size=5000)
+sap = sap_score.compute_sap(z, factors)["sap_score"]
 
-    # DCI (uses the original `factors` directly)
-    dci_scores = dci.compute_dci(latents, factors)
-    dci_disentanglement = dci_scores["disentanglement"]
-    dci_completeness = dci_scores["completeness"]
-    dci_informativeness = dci_scores["informativeness_test"]
-
-    # SAP (uses the original `factors` directly)
-    sap_score_value = sap_score.compute_sap(latents, factors)["SAP_score"]
-
-    metrics = {
-        "MIG": mig_score,
-        "DCI Disentanglement": dci_disentanglement,
-        "DCI Completeness": dci_completeness,
-        "DCI Informativeness": dci_informativeness,
-        "SAP": sap_score_value,
-    }
-
-    for key, value in metrics.items():
-        print(f"{key}: {value:.4f}")
-
-    return metrics
-
-
-if __name__ == "__main__":
-    latents_path = "latents.npy"
-    factors_path = "factors.npy"
-    
-    # Adjust `num_train` as needed
-    compute_disentanglement_metrics(latents_path, factors_path, num_train=10000, random_state=42)
+# Output results
+print(f"DCI: disentanglement={dci_scores['disentanglement']:.4f}, completeness={dci_scores['completeness']:.4f}")
+print(f"SAP: {sap:.4f}")
