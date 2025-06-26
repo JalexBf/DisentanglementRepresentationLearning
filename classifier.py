@@ -113,7 +113,7 @@ def train_classifier(npz_path, save_path='dsprites_classifier.pt', epochs=5, bat
 
     # Save model
     torch.save(model.state_dict(), save_path)
-    print(f"✅ Saved classifier to {save_path}")
+    print(f"Saved classifier to {save_path}")
 
 
 if __name__ == "__main__":

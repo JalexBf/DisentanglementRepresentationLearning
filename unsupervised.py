@@ -274,38 +274,41 @@ class DDPM:
         return xt, noise
 
 
-    def train_step(self, x0, latents, classifier_weight=0.2):
+    def train_step(self, x0, latents, classifier_weight=0.05, epoch=0):
         self.model.train()
         B = x0.size(0)
         device = x0.device
         z = self.encoder(x0)  
 
-        # Randomly sample a time step for each image
         t = torch.randint(0, self.T, (B,), dtype=torch.long, device=device)
-        xt, noise = self.noise_schedule(x0, t)  # Apply noise at selected timestep
+        xt, noise = self.noise_schedule(x0, t)
         pred_noise = self.model(xt, t, z)
 
-        # Standard DDPM loss
         loss = F.mse_loss(pred_noise, noise)
 
-        # Reconstruct image from pred_noise (approximate x0)
         alpha_hat = self.alpha_hat[t].reshape(B, 1, 1, 1)
         x0_hat = (xt - (1 - alpha_hat).sqrt() * pred_noise) / alpha_hat.sqrt()
         x0_hat = x0_hat.clamp(-1, 1)
 
-        # Classifier regularization (latent prediction from image)
-        preds = self.classifier(x0_hat)
+        if epoch >= 5:
+            preds = self.classifier(z)  
+            disent_loss = sum([
+                F.cross_entropy(preds[0], latents[:, 1]),
+                F.cross_entropy(preds[1], latents[:, 2]),
+                F.cross_entropy(preds[2], latents[:, 3]),
+                F.cross_entropy(preds[3], latents[:, 4]),
+                F.cross_entropy(preds[4], latents[:, 5]),
+            ])
+            total_loss = loss + classifier_weight * disent_loss
 
-        disent_loss = sum([
-            F.cross_entropy(preds[0], latents[:, 1]),  # shape
-            F.cross_entropy(preds[1], latents[:, 2]),  # scale
-            F.cross_entropy(preds[2], latents[:, 3]),  # orient
-            F.cross_entropy(preds[3], latents[:, 4]),  # posX
-            F.cross_entropy(preds[4], latents[:, 5]),  # posY
-        ])
 
-        total_loss = loss + classifier_weight * disent_loss
+        else:
+            preds = [torch.zeros(B, 1, device=device) for _ in range(5)]
+            disent_loss = torch.tensor(0.0, device=device)
+            total_loss = loss
+
         return total_loss, loss.detach(), disent_loss.detach(), preds
+
 
 
     # Reverse diffusion process
@@ -388,7 +391,7 @@ if __name__ == "__main__":
             latents = latents.to(device)
             
             try:
-                total_loss, mse_loss, class_loss, preds = ddpm.train_step(imgs, latents, classifier_weight=0.2)
+                total_loss, mse_loss, class_loss, preds = ddpm.train_step(imgs, latents, classifier_weight=0.05, epoch=epoch)
             except RuntimeError as e:
                 if 'out of memory' in str(e):
                     print(f"OOM at epoch {epoch}, step {i} — batch skipped.")

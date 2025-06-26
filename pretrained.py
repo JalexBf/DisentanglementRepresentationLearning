@@ -9,6 +9,7 @@ import math
 from copy import deepcopy
 from torch.cuda.amp import autocast, GradScaler
 import torchvision.transforms.functional as TF
+from stupid_encoder import LatentClassifier, LatentEncoder
 
 
 torch.manual_seed(0)
@@ -29,7 +30,7 @@ class DSpritesLazyDataset(Dataset):
     def __getitem__(self, idx):
         img = self.imgs[idx].astype(np.float32)
         img = torch.from_numpy(img).unsqueeze(0)  # (1, 64, 64)
-        img = TF.resize(img, [32, 32], interpolation=TF.InterpolationMode.BILINEAR)
+        #img = TF.resize(img, [32, 32], interpolation=TF.InterpolationMode.BILINEAR)
         img = (img > 0.5).float()  # re-binarize just in case
         img = img * 2.0 - 1.0  # scale to [-1, 1]
         return img
@@ -61,8 +62,26 @@ class ResidualBlock(nn.Module):
         self.use_z = cond_dim is not None
         if self.use_z:
             self.cond_proj = nn.Linear(cond_dim, out_channels)
+
         self.time_emb_proj = nn.Linear(time_emb_dim, out_channels)
-        ...
+
+        self.block1 = nn.Sequential(
+            nn.GroupNorm(8, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        )
+
+        self.block2 = nn.Sequential(
+            nn.GroupNorm(8, out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        )
+
+        self.shortcut = (
+            nn.Conv2d(in_channels, out_channels, 1)
+            if in_channels != out_channels else nn.Identity()
+        )
+
     
     def forward(self, x, t, z=None):
         h = self.block1(x)
@@ -95,7 +114,7 @@ class Upsample(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, cond_dim=5):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, cond_dim=11):
         super().__init__()
         self.cond_dim = cond_dim
         self.time_mlp = nn.Sequential(
@@ -175,21 +194,45 @@ class DDPM:
         xt = sqrt_alpha_hat * x0 + sqrt_one_minus * noise
         return xt, noise
 
-    def train_step(self, x0):
+    def train_step(self, x0, encoder=None, classifier=None, lambda_dis=1.0):
         self.model.train()
         B = x0.size(0)
         device = x0.device
         t = torch.randint(0, self.T, (B,), dtype=torch.long, device=device)
         xt, noise = self.noise_schedule(x0, t)
-        z = torch.zeros(B, 5, device=device)
-        pred_noise = self.model(xt, t, z)
-        return F.mse_loss(pred_noise, noise)
+
+        with torch.no_grad():
+            z_dis = encoder(x0, normalize=True)
+
+        pred_noise = self.model(xt, t, z_dis)
+        loss_recon = F.mse_loss(pred_noise, noise)
+
+        # --- Disentanglement loss ---
+        loss_dis = torch.tensor(0.0, device=device)
+        if classifier is not None:
+            # Decode predicted z back into image
+            x_recon = xt - pred_noise  # predicted x0 approximation (noisy, but works)
+            z_recon = encoder(x_recon, normalize=True)
+            preds = classifier(z_recon)
+            with torch.no_grad():
+                targets = classifier(z_dis)
+
+            # Cross-entropy between predicted classes
+            for pred, target in zip(preds, targets):
+                target_class = target.argmax(dim=1)
+                loss_dis += F.cross_entropy(pred, target_class)
+
+            loss_dis = loss_dis / len(preds)
+
+        total_loss = loss_recon + lambda_dis * loss_dis
+        return total_loss
+
 
     @torch.no_grad()
     def sample(self, img_size, batch_size=256):
         device = next(self.model.parameters()).device
         img = torch.randn(batch_size, 1, img_size, img_size, device=device)
-        z = torch.zeros(batch_size, 5, device=device)
+        z = torch.zeros(batch_size, self.model.cond_dim, device=device) 
         for t in reversed(range(self.T)):
             time = torch.full((batch_size,), t, device=device, dtype=torch.long)
             pred_noise = self.model(img, time, z)
@@ -199,6 +242,61 @@ class DDPM:
             noise = torch.randn_like(img) if t > 0 else torch.zeros_like(img)
             img = (1 / alpha.sqrt()) * (img - ((1 - alpha) / (1 - alpha_hat).sqrt()) * pred_noise) + beta.sqrt() * noise
         return img.clamp(-1, 1)
+    
+
+    @torch.no_grad()
+    def sample_from_z(self, z, img_size):
+        B = z.size(0)
+        device = z.device
+        img = torch.randn(B, 1, img_size, img_size, device=device)
+        for t in reversed(range(self.T)):
+            time = torch.full((B,), t, device=device, dtype=torch.long)
+            pred_noise = self.model(img, time, z)
+            alpha = self.alpha[t]
+            alpha_hat = self.alpha_hat[t]
+            beta = self.beta[t]
+            noise = torch.randn_like(img) if t > 0 else torch.zeros_like(img)
+            img = (1 / alpha.sqrt()) * (img - ((1 - alpha) / (1 - alpha_hat).sqrt()) * pred_noise) + beta.sqrt() * noise
+        return img.clamp(-1, 1)
+
+
+
+
+
+@torch.no_grad()
+def full_latent_traversal(ddpm, img_size=64, n_steps=7, scale=3.0, epoch=0):
+    import torchvision.utils as vutils
+    device = next(ddpm.model.parameters()).device
+
+    z_dim = ddpm.model.cond_dim
+    z_base = torch.zeros(1, z_dim, device=device)
+    steps = torch.linspace(-scale, scale, n_steps, device=device)
+
+    # Mapping from factor to latent dim slice
+    FACTOR_SLICES = {
+        'shape': (0, 1),
+        'scale': (1, 3),
+        'rotation': (3, 7),
+        'pos_x': (7, 9),
+        'pos_y': (9, 11)
+    }
+
+    all_imgs = []
+
+    for name, (start, end) in FACTOR_SLICES.items():
+        z_traversal = z_base.repeat(n_steps, 1)
+        for i in range(start, end):
+            z_traversal[:, i] = steps  # same steps applied to each subdim
+        imgs = ddpm.sample_from_z(z_traversal, img_size)
+        imgs = (imgs + 1) * 0.5  # [-1, 1] → [0, 1]
+        all_imgs.append(imgs)
+
+    # Stack rows vertically into a big grid (5 rows × n_steps)
+    grid = torch.cat(all_imgs, dim=0)
+    save_path = f'./pretrained_samples/latent_grid_epoch_{epoch}.png'
+    vutils.save_image(grid, save_path, nrow=n_steps)
+
+
 
 
 # ------------------------------
@@ -210,6 +308,23 @@ if __name__ == "__main__":
 
     dataset = DSpritesLazyDataset('dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz')
     dataloader = DataLoader(dataset, batch_size=512, shuffle=True, num_workers=8)
+
+
+    enc = LatentEncoder(z_dim=11).to(device)
+    clf = LatentClassifier().to(device)
+    state = torch.load('pretrained.pt', map_location=device)
+    enc.load_state_dict(state['encoder'])
+    clf.load_state_dict(state['classifier'])
+
+    # Freeze them
+    enc.eval()
+    clf.eval()
+    for p in enc.parameters():
+        p.requires_grad = False
+    for p in clf.parameters():
+        p.requires_grad = False
+
+
 
     # Build and compile once
     model = UNet(base_channels=64).to(device)
@@ -224,8 +339,8 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
 
-    os.makedirs('./simple_checkpoints', exist_ok=True)
-    os.makedirs('./simple_samples', exist_ok=True)
+    os.makedirs('./pretrained_checkpoints', exist_ok=True)
+    os.makedirs('./pretrained_samples', exist_ok=True)
 
     scaler = torch.cuda.amp.GradScaler()
     save_every = 1
@@ -234,28 +349,40 @@ if __name__ == "__main__":
 
     start_epoch = 1  # default starting point
 
-    checkpoint_dir = './simple_checkpoints'
+    checkpoint = None
+    start_epoch = 1
+
+    checkpoint_dir = './pretrained_checkpoints'
     latest_ckpt = sorted(
         [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')],
         key=lambda x: int(x.split('_')[-1].split('.')[0])
     )
 
-
-    checkpoint = None
-
     if latest_ckpt:
         path = os.path.join(checkpoint_dir, latest_ckpt[-1])
         print(f"Resuming from checkpoint: {path}")
         checkpoint = torch.load(path, map_location=device)
+
         model.load_state_dict(checkpoint['model_state_dict'])
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
 
-    if checkpoint is not None and 'ema_state_dict' in checkpoint:
-        ema_model.load_state_dict(checkpoint['ema_state_dict'])
-    else:
-        print("No EMA state found in checkpoint. Reinitializing EMA.")
+        if 'encoder_state_dict' in checkpoint:
+            enc.load_state_dict(checkpoint['encoder_state_dict'])
+            clf.load_state_dict(checkpoint['classifier_state_dict'])
+            enc.eval()
+            clf.eval()
+            for p in enc.parameters():
+                p.requires_grad = False
+            for p in clf.parameters():
+                p.requires_grad = False
+        else:
+            print("⚠️  Warning: encoder/classifier not found in checkpoint. Falling back to pretrained.pt")
+            pretrained = torch.load('pretrained.pt', map_location=device)
+            enc.load_state_dict(pretrained['encoder'])
+            clf.load_state_dict(pretrained['classifier'])
 
 
 
@@ -266,7 +393,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast():
-                loss = ddpm.train_step(batch)
+                loss = ddpm.train_step(batch, encoder=enc, classifier=clf, lambda_dis=1.0)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -292,8 +419,10 @@ if __name__ == "__main__":
                 'ema_state_dict': ema_model.state_dict(),  
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'encoder_state_dict': enc.state_dict(),  
+                'classifier_state_dict': clf.state_dict(), 
                 'epoch': epoch,
-            }, f'./simple_checkpoints/ddpm_epoch_{epoch}.pt')
+            }, f'./pretrained_checkpoints/ddpm_epoch_{epoch}.pt')
 
 
             print(f"Saved checkpoint at epoch {epoch}")
@@ -301,20 +430,30 @@ if __name__ == "__main__":
             # Use EMA model temporarily for sampling
             ddpm.model = ema_model
             with torch.no_grad():
-                img = fixed_noise.clone()
-                for t in reversed(range(ddpm.T)):
-                    time = torch.full((img.size(0),), t, device=device, dtype=torch.long)
-                    pred_noise = ddpm.model(img, time)
-                    alpha = ddpm.alpha[t]
-                    alpha_hat = ddpm.alpha_hat[t]
-                    beta = ddpm.beta[t]
-                    noise = torch.randn_like(img) if t > 0 else torch.zeros_like(img)
-                    img = (1 / alpha.sqrt()) * (img - ((1 - alpha) / (1 - alpha_hat).sqrt()) * pred_noise) + beta.sqrt() * noise
-                sampled_imgs = img.clamp(-1, 1)
+                z = torch.zeros(16, ddpm.model.cond_dim, device=device)
+                sampled_imgs = ddpm.sample_from_z(z, img_size=64)
+                # === Latent prediction check ===
+                with torch.no_grad():
+                    # Get predicted latents from generated images
+                    z_pred = enc(sampled_imgs, normalize=True)
+                    preds = clf(z_pred)
 
-            sampled_imgs = (sampled_imgs + 1) * 0.5
-            save_image(sampled_imgs, f'./simple_samples/sample_epoch_{epoch}.png', nrow=4)
+                    targets = clf(z)  # should decode same as z
+                    correct = []
+
+                    for pred, target in zip(preds, targets):
+                        pred_class = pred.argmax(dim=1)
+                        target_class = target.argmax(dim=1)
+                        correct.append((pred_class == target_class).float().mean().item())
+
+                    acc_names = ['shape', 'scale', 'rotation', 'pos_x', 'pos_y']
+                    for name, acc in zip(acc_names, correct):
+                        print(f"DDPM sample latent {name} accuracy: {acc:.3f}")
+
+
+            full_latent_traversal(ddpm, img_size=64, epoch=epoch)
             print(f"Saved samples at epoch {epoch}")
+
 
             # === Sample Quality Metrics ===
             with torch.no_grad():
@@ -326,7 +465,8 @@ if __name__ == "__main__":
                 real_batch = F.interpolate(real_batch, size=(64, 64), mode='bilinear', align_corners=False)
 
                 # L1 Distance (in [-1, 1] space)
-                l1 = F.l1_loss(gen_batch * 2 - 1, real_batch).item()
+                l1 = F.l1_loss(gen_batch, real_batch).item()
+
 
                 # Binariness score
                 binariness = ((gen_batch < 0.05) | (gen_batch > 0.95)).float().mean().item()
@@ -334,7 +474,7 @@ if __name__ == "__main__":
                 print(f"Sample Quality @ Epoch {epoch} | L1: {l1:.4f} | Binariness: {binariness:.4f}")
 
                 # Save to text file
-                with open("./simple_samples/sample_quality.txt", "a") as f:
+                with open("./pretrained_samples/sample_quality.txt", "a") as f:
                     f.write(f"{epoch},{l1:.4f},{binariness:.4f}\n")
 
                 pure_black = (sampled_imgs.view(sampled_imgs.size(0), -1).max(dim=1).values < 0.05).float().mean().item()
@@ -346,4 +486,4 @@ if __name__ == "__main__":
 
 
 
-        scheduler.step()
+        scheduler.step()                                            

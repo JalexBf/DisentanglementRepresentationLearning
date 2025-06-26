@@ -377,13 +377,40 @@ if __name__ == "__main__":
     os.makedirs('./classifier_checkpoints', exist_ok=True)
     os.makedirs('./classifier_samples', exist_ok=True)
 
-    save_every = 1  # epochs
 
-    for epoch in range(1, 21):
+    start_epoch = 1  # default starting epoch
+    checkpoint_dir = './classifier_checkpoints'
+
+    latest_ckpt = sorted(
+        [f for f in os.listdir(checkpoint_dir) if f.startswith('ddpm_epoch_') and f.endswith('.pt')],
+        key=lambda x: int(x.split('_')[-1].split('.')[0])
+    )
+
+    if latest_ckpt:
+        checkpoint_path = os.path.join(checkpoint_dir, latest_ckpt[-1])
+        print(f"Resuming from checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        start_epoch = ckpt['epoch'] + 1  # continue from next epoch
+
+
+
+    save_every = 1  # epochs
+    best_loss = float('inf')
+    patience = 5  # stop if no improvement for 5 epochs
+    patience_counter = 0
+
+    for epoch in range(start_epoch, 21):
+        # Before batch loop
+        epoch_total_loss = 0.0
+        num_batches = 0
+
         for i, (imgs, latents) in enumerate(dataloader):
             imgs = imgs.to(device)
             latents = latents.to(device)
-            
+
             try:
                 total_loss, mse_loss, class_loss, preds = ddpm.train_step(imgs, latents, classifier_weight=0.2)
             except RuntimeError as e:
@@ -398,13 +425,14 @@ if __name__ == "__main__":
             total_loss.backward()
             optimizer.step()
 
+            epoch_total_loss += total_loss.item()
+            num_batches += 1
+
             if i % 100 == 0:
                 with torch.no_grad():
                     pred_labels = [p.argmax(1) for p in preds]
-                    # preds[0:5] must match latents[:, 1:6] → shape, scale, orient, posX, posY
                     accs = [((pred == latents[:, j+1]).float().mean().item()) for j, pred in enumerate(pred_labels)]
                     print(f"Accuracies: shape={accs[0]:.2f}, scale={accs[1]:.2f}, orient={accs[2]:.2f}, posX={accs[3]:.2f}, posY={accs[4]:.2f}")
-
                     t = torch.randint(0, ddpm.T, (imgs.size(0),), device=imgs.device)
                     xt, noise = ddpm.noise_schedule(imgs, t)
                     mean_xt = xt.abs().mean().item()
@@ -412,17 +440,37 @@ if __name__ == "__main__":
 
                 print(f"Epoch {epoch} | Step {i} | Total: {total_loss.item():.4f} | MSE: {mse_loss.item():.4f} | Classifier: {class_loss.item():.4f} | Mean xt: {mean_xt:.4f} | Mean noise: {mean_noise:.4f}")
 
+        # After batch loop (end of epoch)
+        avg_loss = epoch_total_loss / num_batches
+        if avg_loss < best_loss - 1e-4:
+            best_loss = avg_loss
+            patience_counter = 0
+            print(f"New best loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
+
+
+        
+        
         # Save checkpoint & samples every few epochs
         if epoch % save_every == 0:
             # Save model
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'epoch': epoch,
             }, f'./classifier_checkpoints/ddpm_epoch_{epoch}.pt')
+
             print(f"Saved checkpoint at epoch {epoch}")
 
             sampler = FeatureSampler(model, ddpm, device)
             sampler.sample_all_features(epoch)
+
 
         scheduler.step()
